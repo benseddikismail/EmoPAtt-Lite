@@ -10,7 +10,7 @@ Facial expressions play a vital role in human communication, serving as a potent
     pip3 install -r requirements.txt
     ```
 
-2. Navigate to the ***dataset/*** directory and run to prepare FER2013
+2. Navigate to the ***dataset/*** directory and run the following to prepare FER2013
     ```
     python3 load_dataset.py
     ```
