@@ -20,7 +20,7 @@ from sklearn.utils.class_weight import compute_class_weight
 # import seaborn as sns
 from elements import SEBlock, SpatialTransformerLayer
 
-class ExpandDimsLayer(layers.Layer):
+class ExpandDimsLayer(tf.keras.layers.Layer):
     def __init__(self, axis, **kwargs):
         super(ExpandDimsLayer, self).__init__(**kwargs)
         self.axis = axis
