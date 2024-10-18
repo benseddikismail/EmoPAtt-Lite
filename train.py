@@ -18,9 +18,23 @@ from sklearn.utils.class_weight import compute_class_weight
 # from sklearn.metrics import confusion_matrix
 # import matplotlib.pyplot as plt
 # import seaborn as sns
-
 from elements import SEBlock, SpatialTransformerLayer
 
+class ExpandDimsLayer(layers.Layer):
+    def __init__(self, axis, **kwargs):
+        super(ExpandDimsLayer, self).__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.expand_dims(inputs, axis=self.axis)
+
+class SqueezeLayer(layers.Layer):
+    def __init__(self, axis, **kwargs):
+        super(SqueezeLayer, self).__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.squeeze(inputs, axis=self.axis)
 
 def main(train_epochs = 30,
          ft_epochs = 100,
@@ -48,7 +62,7 @@ def main(train_epochs = 30,
     TRAIN_MIN_LR = 1e-6
     TRAIN_DROPOUT = dropout
 
-    FT_EPOCH = ft_epochs
+    FT_EPOCH = ft_epochs #500
     FT_LR = 1e-5
     FT_LR_DECAY_STEP = 80.0
     FT_LR_DECAY_RATE = 1
