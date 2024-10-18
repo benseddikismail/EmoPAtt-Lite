@@ -28,7 +28,7 @@ class ExpandDimsLayer(tf.keras.layers.Layer):
     def call(self, inputs):
         return tf.expand_dims(inputs, axis=self.axis)
 
-class SqueezeLayer(layers.Layer):
+class SqueezeLayer(tf.keras.layers.Layer):
     def __init__(self, axis, **kwargs):
         super(SqueezeLayer, self).__init__(**kwargs)
         self.axis = axis
