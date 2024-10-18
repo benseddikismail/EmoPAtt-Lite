@@ -48,7 +48,7 @@ def main(train_epochs = 30,
     TRAIN_MIN_LR = 1e-6
     TRAIN_DROPOUT = dropout
 
-    FT_EPOCH = ft_epochs #500
+    FT_EPOCH = ft_epochs
     FT_LR = 1e-5
     FT_LR_DECAY_STEP = 80.0
     FT_LR_DECAY_RATE = 1
@@ -84,10 +84,10 @@ def main(train_epochs = 30,
         seed=123,
     )
 
-    # data augmentation and preprocessing layers
+    # Data augmentation
     data_augmentation = tf.keras.Sequential([
-        tf.keras.layers.experimental.preprocessing.RandomFlip("horizontal"),
-        tf.keras.layers.experimental.preprocessing.RandomContrast(factor=0.3),
+        tf.keras.layers.RandomFlip("horizontal"),
+        tf.keras.layers.RandomContrast(factor=0.3),
     ])
 
     train_ds = train_ds.map(lambda x, y: (data_augmentation(x), y))
@@ -95,7 +95,7 @@ def main(train_epochs = 30,
 
     # Model Building
     input_layer = tf.keras.Input(shape=IMG_SHAPE, name='universal_input')
-    sample_resizing = tf.keras.layers.experimental.preprocessing.Resizing(224, 224, name="resize")
+    sample_resizing = tf.keras.layers.Resizing(224, 224, name="resize")
     data_augmentation = tf.keras.Sequential([tf.keras.layers.RandomFlip(mode='horizontal'),
                                             tf.keras.layers.RandomContrast(factor=0.3)], name="augmentation")
     preprocess_input = tf.keras.applications.mobilenet.preprocess_input
@@ -134,14 +134,23 @@ def main(train_epochs = 30,
     x = global_average_layer(x)
     x = tf.keras.layers.Dropout(TRAIN_DROPOUT)(x)
     x = pre_classification(x)
-    x = self_attention([x, x])
+
+    x = ExpandDimsLayer(axis=1)(x)  # Expand dimensions to make it 3D
+    x = self_attention([x, x])  # Apply Attention
+    x = SqueezeLayer(axis=1)(x)  # Squeeze back to 2D
+
+
     outputs = prediction_layer(x)
     model = tf.keras.Model(inputs, outputs, name='train-head')
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=TRAIN_LR, global_clipnorm=3.0), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=TRAIN_LR, global_clipnorm=3.0), 
+                  loss='sparse_categorical_crossentropy', 
+                  metrics=['accuracy'])
 
-    # Training
+    # Callbacks
     early_stopping_callback = tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=TRAIN_ES_PATIENCE, min_delta=ES_LR_MIN_DELTA, restore_best_weights=True)
     learning_rate_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=TRAIN_LR_PATIENCE, verbose=0, min_delta=ES_LR_MIN_DELTA, min_lr=TRAIN_MIN_LR)
+
+    # Training
     history = model.fit(train_ds, epochs=TRAIN_EPOCH, validation_data=val_ds, callbacks=[early_stopping_callback, learning_rate_callback])
 
     # Model Finetuning
@@ -163,28 +172,32 @@ def main(train_epochs = 30,
     x = data_augmentation(x)
     x = preprocess_input(x)
     x = base_model(x, training=False)
-
-    # x = CBAMLayer()(x) 
-
     x = patch_extraction(x)
     x = tf.keras.layers.SpatialDropout2D(FT_DROPOUT)(x)
     x = global_average_layer(x)
     x = tf.keras.layers.Dropout(FT_DROPOUT)(x)
     x = pre_classification(x)
-    x = self_attention([x, x])
+
+    x = ExpandDimsLayer(axis=1)(x)  # Expand dimensions to make it 3D
+    x = self_attention([x, x])  # Apply Attention
+    x = SqueezeLayer(axis=1)(x)  # Squeeze back to 2D
+
+    scheduler = keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=FT_LR, decay_steps=FT_LR_DECAY_STEP, decay_rate=FT_LR_DECAY_RATE)
+
     x = tf.keras.layers.Dropout(FT_DROPOUT)(x)
     outputs = prediction_layer(x)
     model = tf.keras.Model(inputs, outputs, name='finetune-backbone')
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=FT_LR, global_clipnorm=3.0), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=scheduler, global_clipnorm=3.0),
+                  loss='sparse_categorical_crossentropy', 
+                  metrics=['accuracy'])
 
     # Training Procedure
     log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
     early_stopping_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', min_delta=ES_LR_MIN_DELTA, patience=FT_ES_PATIENCE, restore_best_weights=True)
-    scheduler = keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=FT_LR, decay_steps=FT_LR_DECAY_STEP, decay_rate=FT_LR_DECAY_RATE)
-    scheduler_callback = tf.keras.callbacks.LearningRateScheduler(schedule=scheduler)
+    # scheduler_callback = tf.keras.callbacks.LearningRateScheduler(schedule=scheduler)
 
-    history_finetune = model.fit(train_ds, epochs=FT_EPOCH, validation_data=val_ds, callbacks=[early_stopping_callback, scheduler_callback, tensorboard_callback])
+    history_finetune = model.fit(train_ds, epochs=FT_EPOCH, validation_data=val_ds, callbacks=[early_stopping_callback, tensorboard_callback])
 
     # # Plotting
     # plt.figure(figsize=(12, 6))
