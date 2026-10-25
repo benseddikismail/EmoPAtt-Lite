@@ -1,9 +1,4 @@
 """Train EmoPAtt-Lite on FER2013.
-
-Two stages, mirroring the original recipe but with the pieces that were missing:
-a frozen-trunk warmup for the freshly initialised head, then an end-to-end
-fine-tune on a cosine schedule with mixup/cutmix, label smoothing and weight
-averaging.
 """
 
 import argparse

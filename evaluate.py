@@ -1,7 +1,4 @@
 """Evaluate one or more trained EmoPAtt-Lite checkpoints on FER2013.
-
-Passing several checkpoints averages their softmax outputs, which is how the
-FER2013 leaderboard entries are usually built.
 """
 
 import argparse

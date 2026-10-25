@@ -131,10 +131,6 @@ class SeparableConv(nn.Module):
 
 class PatchExtraction(nn.Module):
     """Re-encode the truncated backbone's feature map into a grid of patch tokens.
-
-    Unlike the original, the stride-4 / stride-2 pair is replaced by a single
-    stride-2 stage: collapsing a 14x14 map down to 2x2 leaves the attention
-    classifier with four tokens, which is too few for attention to do anything.
     """
 
     def __init__(self, in_channels, out_channels=256, stride=2, use_se=True):
@@ -157,11 +153,6 @@ class PatchExtraction(nn.Module):
 
 class AttentionClassifier(nn.Module):
     """Self-attention over the patch tokens, then attention pooling + a linear head.
-
-    The original applied Keras' Attention layer to a length-1 sequence, where
-    softmax over a single key returns the value unchanged -- an exact no-op.
-    Here attention runs over the HxW patch tokens, so it can actually weight
-    facial regions against each other.
     """
 
     def __init__(

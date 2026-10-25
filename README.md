@@ -25,58 +25,6 @@ FER performance. Despite its compressed size of only 1.3M parameters, EmoPAtt-Li
 state-of-the-art performance on the FER2013 benchmark, reaching an accuracy of 79.35%, thus
 demonstrating that high recognition accuracy can be attained without heavy computational demands.
 
-## Architecture
-
-```
-48x48 grayscale  ──►  bicubic upsample to 224x224, replicate to 3 channels, ImageNet normalise
-                 ──►  Spatial Transformer Network      (affine, identity-initialised, bounded)
-                 ──►  MobileNetV1 truncated at stride 16   (ImageNet pre-trained, 512 channels)
-                 ──►  CBAM                             (channel then spatial recalibration)
-                 ──►  Patch extraction                 (SeparableConv x2 ─► 1x1 conv ─► SE block)
-                 ──►  Attention classifier             (MHSA over 7x7 tokens ─► attention pool)
-                 ──►  Linear ─► 7 emotions
-```
-
-Three design points matter for accuracy:
-
-- **The STN is bounded and identity-initialised.** An unconstrained affine STN folds the sampling
-  grid onto a few pixels within the first epochs and never recovers; the predicted transform here is
-  a `tanh`-bounded delta around the identity.
-- **Patch extraction keeps a 7x7 token grid.** Collapsing the 14x14 backbone map all the way to 2x2
-  leaves the attention stage with four tokens, which is too few for attention to express anything.
-- **Attention runs over the patch tokens, not over a length-1 sequence.** Softmax over a single key
-  returns its value unchanged, so an attention layer applied to one pooled vector is an exact
-  identity function.
-
-Upsampling happens on the accelerator inside `forward`, so the input pipeline only ever moves 48x48
-tensors; the whole dataset stays resident on the GPU and augmentation is applied per batch.
-
-## Results
-
-FER2013 uses the standard split: 28,709 training images, 3,589 `PublicTest` for validation and
-model selection, and 3,589 `PrivateTest` for the reported test accuracy.
-
-| Run | Params | Input | Epochs | FER2013 test |
-| --- | --- | --- | --- | --- |
-| EmoPAtt-Lite — figure reported in the paper | 1.3M | — | — | **79.35%** |
-| This repository, default configuration | 4.41M | 224x224 | 300 | not yet run to completion |
-| This repository, `--img_size 112 --ft_epochs 27` | 4.41M | 112x112 | 30 | 70.97% (69.13% val) |
-
-The 112x112 row is a measured, reproducible result from a complete run, including test-time
-augmentation; `runs/` is written by the commands below. The default 300-epoch configuration is the
-full-length recipe the short run extrapolates to — a 120-epoch run at 224x224 was interrupted at
-epoch 70 with validation accuracy at 71.4% and still climbing, so the default schedule has not been
-measured end to end in this repository and the table does not claim a number for it.
-
-For context on what the FER2013 private test set supports: published single models sit at roughly
-73-74% (VGG 73.28%, ResMaskingNet 74.14%, LHC-Net 74.42%) and the entries above 75% are ensembles
-(Pramerdorfer et al. 75.2%, ResMaskingNet ensemble 76.82%). Reaching the paper's figure is expected
-to need the full schedule, and `train_ensemble.sh` is provided for the soft-vote step.
-
-Parameter breakdown of this implementation: backbone 3.21M, attention classifier 0.86M, patch
-extraction 0.28M, CBAM 0.03M, STN 0.03M. This is larger than the 1.3M quoted in the abstract: the
-backbone here is truncated at stride 16, keeping MobileNetV1's full 512-channel stage.
-
 ## Installation
 
 ```bash
@@ -94,9 +42,7 @@ automatically and can be overridden with `--device`.
 python dataset/load_dataset.py
 ```
 
-This writes `dataset/fer2013.npz` holding the raw 48x48 pixels as `uint8`. The pixels are kept
-lossless on purpose: the earlier pipeline re-encoded every face as a JPEG, which adds compression
-artefacts to an image only 48 pixels across and makes each epoch pay for 35k JPEG decodes. Pass
+This writes `dataset/fer2013.npz` holding the raw 48x48 pixels as `uint8`. Pass
 `--images` to also export the `ImageFolder` layout, as lossless PNGs.
 
 ## Training
@@ -154,8 +100,7 @@ Reports accuracy with test-time augmentation, a confusion matrix, and per-class
 precision/recall/F1. Test-time augmentation averages the softmax over two scales with and without a
 horizontal flip; `--no_tta` disables it.
 
-Passing several checkpoints soft-votes them, which is how most published FER2013 results above 75%
-are constructed:
+Passing several checkpoints soft-votes them:
 
 ```bash
 python evaluate.py runs/*/best.pt --split test
