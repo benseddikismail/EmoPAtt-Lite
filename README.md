@@ -137,3 +137,7 @@ it. Any `timm` backbone that exposes `features_only` works via `--backbone`.
   isbn      = {978-3-032-21174-3}
 }
 ```
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE).
