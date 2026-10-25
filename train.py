@@ -1,297 +1,342 @@
-import shutil
-import subprocess
+"""Train EmoPAtt-Lite on FER2013.
+
+Two stages, mirroring the original recipe but with the pieces that were missing:
+a frozen-trunk warmup for the freshly initialised head, then an end-to-end
+fine-tune on a cosine schedule with mixup/cutmix, label smoothing and weight
+averaging.
+"""
+
 import argparse
-# import tarfile
+import json
 import os
-import random
-import pandas as pd
+import time
+
 import numpy as np
-# from PIL import Image
-import h5py
-import datetime
-import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from sklearn.utils import shuffle
-from sklearn.utils.class_weight import compute_class_weight
-# from sklearn.metrics import classification_report
-# from sklearn.metrics import confusion_matrix
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-from elements import SEBlock, SpatialTransformerLayer
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-class ExpandDimsLayer(tf.keras.layers.Layer):
-    def __init__(self, axis, **kwargs):
-        super(ExpandDimsLayer, self).__init__(**kwargs)
-        self.axis = axis
-
-    def call(self, inputs):
-        return tf.expand_dims(inputs, axis=self.axis)
-
-class SqueezeLayer(tf.keras.layers.Layer):
-    def __init__(self, axis, **kwargs):
-        super(SqueezeLayer, self).__init__(**kwargs)
-        self.axis = axis
-
-    def call(self, inputs):
-        return tf.squeeze(inputs, axis=self.axis)
-
-def main(train_epochs = 30,
-         ft_epochs = 100,
-         batch_size = 32,
-         learning_rate = 1e-3,
-         dropout = 0.1):
-    
-    # random.seed(0)
-    # np.random.seed(0)
-    # tf.random.set_seed(0)
-    # physical_devices = tf.config.list_physical_devices('GPU')
-    # if len(physical_devices) > 0:
-    #     tf.config.experimental.set_memory_growth(physical_devices[0], True)
+from data import CLASSES, Batches, GPUAugment, load_split, mixup_cutmix, one_hot, tta_views
+from elements import ModelEMA
+from model import build_model
+from scheduler import CosineWithWarmup
 
 
+def pick_device(requested):
+    if requested != "auto":
+        return torch.device(requested)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
-    IMG_SHAPE = (224, 224, 3)
-    NUM_CLASSES = 7  # Number of emotion classes
-    BATCH_SIZE = batch_size #8
 
-    TRAIN_EPOCH = train_epochs # 100
-    TRAIN_LR = learning_rate
-    TRAIN_ES_PATIENCE = 5
-    TRAIN_LR_PATIENCE = 3
-    TRAIN_MIN_LR = 1e-6
-    TRAIN_DROPOUT = dropout
+def autocast_ctx(device, mode):
+    if mode == "off" or device.type == "cpu":
+        return torch.autocast(device_type="cpu", enabled=False)
+    dtype = torch.float16 if mode == "fp16" else torch.bfloat16
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
-    FT_EPOCH = ft_epochs #500
-    FT_LR = 1e-5
-    FT_LR_DECAY_STEP = 80.0
-    FT_LR_DECAY_RATE = 1
-    FT_ES_PATIENCE = 20
-    FT_DROPOUT = 0.2
 
-    ES_LR_MIN_DELTA = 0.003
+def soft_cross_entropy(logits, target):
+    return torch.sum(-target * F.log_softmax(logits, dim=-1), dim=-1).mean()
 
-    train_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        'dataset/FER2013/train',
-        labels='inferred',
-        label_mode='int',
-        batch_size=BATCH_SIZE,
-        image_size=(224, 224),
-        shuffle=True,
-        seed=123,
+
+@torch.no_grad()
+def evaluate(model, x, y, batch_size, device, amp="off", tta=False, return_logits=False):
+    model.eval()
+    probs = []
+    for xb, _ in Batches(x, y, batch_size):
+        views = tta_views(xb) if tta else [xb]
+        acc = None
+        for view in views:
+            with autocast_ctx(device, amp):
+                out = F.softmax(model(view).float(), dim=-1)
+            acc = out if acc is None else acc + out
+        probs.append((acc / len(views)).cpu())
+    probs = torch.cat(probs)
+    pred = probs.argmax(dim=1)
+    accuracy = (pred == y.cpu()).float().mean().item()
+    return (accuracy, probs) if return_logits else accuracy
+
+
+def save_best(state, args, out_dir):
+    """Persist the best weights seen so far.
+
+    Written every time validation improves rather than once at the end, so an
+    interrupted run still leaves a usable checkpoint behind.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(
+        dict(
+            state_dict=state["best_state"],
+            args=vars(args),
+            best_val=state["best_val"],
+            epoch=state["epoch"],
+            is_ema=state["best_is_ema"],
+        ),
+        os.path.join(out_dir, "best.pt"),
     )
-    val_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        'dataset/FER2013/val',
-        labels='inferred',
-        label_mode='int',
-        batch_size=BATCH_SIZE,
-        image_size=(224, 224),
-        shuffle=False,  
+    with open(os.path.join(out_dir, "history.json"), "w") as fh:
+        json.dump(dict(history=state["history"], args=vars(args), best_val=state["best_val"]), fh, indent=2)
+
+
+def run_stage(
+    name,
+    model,
+    ema,
+    opt,
+    sched,
+    train_x,
+    train_y,
+    val_x,
+    val_y,
+    augment,
+    args,
+    device,
+    epochs,
+    state,
+    out_dir,
+):
+    num_classes = len(CLASSES)
+    for epoch in range(epochs):
+        model.train()
+        started = time.time()
+        total_loss, total_correct, total_seen = 0.0, 0, 0
+
+        for xb, yb in Batches(train_x, train_y, args.batch_size, shuffle=True, drop_last=True):
+            xb = augment(xb)
+            if args.mixup > 0 or args.cutmix > 0:
+                xb, target = mixup_cutmix(
+                    xb,
+                    yb,
+                    num_classes,
+                    mixup_alpha=args.mixup,
+                    cutmix_alpha=args.cutmix,
+                    prob=args.mix_prob,
+                    smoothing=args.smoothing,
+                )
+            else:
+                target = one_hot(yb, num_classes, args.smoothing)
+
+            with autocast_ctx(device, args.amp):
+                logits = model(xb)
+                loss = soft_cross_entropy(logits.float(), target)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if args.clip_grad > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            opt.step()
+            sched.step()
+            if ema is not None:
+                ema.update(model)
+
+            total_loss += loss.item() * yb.size(0)
+            total_correct += (logits.argmax(dim=1) == yb).sum().item()
+            total_seen += yb.size(0)
+
+        val_acc = evaluate(model, val_x, val_y, args.eval_batch_size, device, args.amp)
+        ema_acc = (
+            evaluate(ema.module, val_x, val_y, args.eval_batch_size, device, args.amp)
+            if ema is not None
+            else 0.0
+        )
+        best_of_two = max(val_acc, ema_acc)
+
+        state["epoch"] += 1
+        tag = ""
+        if best_of_two > state["best_val"]:
+            state["best_val"] = best_of_two
+            source = ema.module if ema_acc >= val_acc and ema is not None else model
+            state["best_state"] = {k: v.detach().cpu().clone() for k, v in source.state_dict().items()}
+            state["best_is_ema"] = bool(ema is not None and ema_acc >= val_acc)
+            tag = "  *"
+
+        print(
+            f"[{name}] epoch {state['epoch']:3d}/{state['total_epochs']}  "
+            f"loss {total_loss / total_seen:.4f}  train {total_correct / total_seen:.4f}  "
+            f"val {val_acc:.4f}  ema {ema_acc:.4f}  "
+            f"lr {sched.last_lr[0]:.2e}  {time.time() - started:.0f}s{tag}",
+            flush=True,
+        )
+        state["history"].append(
+            dict(
+                stage=name,
+                epoch=state["epoch"],
+                loss=total_loss / total_seen,
+                train_acc=total_correct / total_seen,
+                val_acc=val_acc,
+                ema_acc=ema_acc,
+            )
+        )
+        if tag:
+            save_best(state, args, out_dir)
+
+
+def main(args):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    device = pick_device(args.device)
+    print(f"device: {device}  backbone: {args.backbone}  img_size: {args.img_size}")
+
+    train_x, train_y = load_split("train", device)
+    val_x, val_y = load_split("val", device)
+    test_x, test_y = load_split("test", device)
+    print(f"train {len(train_x)}  val {len(val_x)}  test {len(test_x)}")
+
+    model = build_model(args, num_classes=len(CLASSES)).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"parameters: {n_params / 1e6:.2f}M")
+
+    augment = GPUAugment(
+        degrees=args.rotate,
+        translate=args.translate,
+        scale=(args.scale_min, args.scale_max),
+        brightness=args.brightness,
+        contrast=args.contrast,
+        erase_prob=args.erase,
     )
-    test_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        'dataset/FER2013/test',
-        labels='inferred',
-        label_mode='int',
-        batch_size=BATCH_SIZE,
-        image_size=(224, 224),
-        shuffle=False,
-        seed=123,
+
+    out_dir = os.path.join("runs", args.name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    steps_per_epoch = len(train_x) // args.batch_size
+    state = dict(
+        epoch=0,
+        total_epochs=args.train_epochs + args.ft_epochs,
+        best_val=0.0,
+        best_state=None,
+        best_is_ema=False,
+        history=[],
     )
 
-    # Data augmentation
-    data_augmentation = tf.keras.Sequential([
-        tf.keras.layers.RandomFlip("horizontal"),
-        tf.keras.layers.RandomContrast(factor=0.3),
-    ])
+    # Stage 1 -- frozen trunk, head only.
+    if args.train_epochs > 0:
+        model.freeze_backbone(True)
+        opt = torch.optim.AdamW(
+            model.param_groups(args.learning_rate, args.learning_rate, args.weight_decay)
+        )
+        sched = CosineWithWarmup(
+            opt,
+            total_steps=args.train_epochs * steps_per_epoch,
+            warmup_steps=min(steps_per_epoch, 200),
+        )
+        run_stage(
+            "head", model, None, opt, sched, train_x, train_y, val_x, val_y,
+            augment, args, device, args.train_epochs, state, out_dir,
+        )
 
-    train_ds = train_ds.map(lambda x, y: (data_augmentation(x), y))
-    # val_ds = val_ds.map(lambda x, y: (data_augmentation(x), y))
+    # Stage 2 -- end-to-end fine-tune.
+    model.freeze_backbone(False)
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    opt = torch.optim.AdamW(
+        model.param_groups(args.ft_head_lr, args.ft_lr, args.weight_decay)
+    )
+    sched = CosineWithWarmup(
+        opt,
+        total_steps=args.ft_epochs * steps_per_epoch,
+        warmup_steps=min(2 * steps_per_epoch, 500),
+        min_lr_ratio=args.min_lr_ratio,
+    )
+    run_stage(
+        "finetune", model, ema, opt, sched, train_x, train_y, val_x, val_y,
+        augment, args, device, args.ft_epochs, state, out_dir,
+    )
 
-    # Model Building
-    input_layer = tf.keras.Input(shape=IMG_SHAPE, name='universal_input')
-    sample_resizing = tf.keras.layers.Resizing(224, 224, name="resize")
-    data_augmentation = tf.keras.Sequential([tf.keras.layers.RandomFlip(mode='horizontal'),
-                                            tf.keras.layers.RandomContrast(factor=0.3)], name="augmentation")
-    preprocess_input = tf.keras.applications.mobilenet.preprocess_input
+    if state["best_state"] is not None:
+        model.load_state_dict(state["best_state"])
+    source = "EMA" if state["best_is_ema"] else "raw"
+    print(f"\nbest val accuracy {state['best_val']:.4f} ({source} weights)")
 
-    # stn_layer = SpatialTransformerLayer(output_size=(224, 224))
+    val_acc, val_probs = evaluate(
+        model, val_x, val_y, args.eval_batch_size, device, args.amp, tta=True, return_logits=True
+    )
+    test_acc, test_probs = evaluate(
+        model, test_x, test_y, args.eval_batch_size, device, args.amp, return_logits=True
+    )
+    test_tta, test_probs_tta = evaluate(
+        model, test_x, test_y, args.eval_batch_size, device, args.amp, tta=True, return_logits=True
+    )
+    print(f"val  (TTA): {val_acc:.4f}")
+    print(f"test       : {test_acc:.4f}")
+    print(f"test (TTA) : {test_tta:.4f}")
 
-    backbone = tf.keras.applications.mobilenet.MobileNet(input_shape=(224, 224, 3), include_top=False, weights='imagenet')
+    torch.save(
+        dict(
+            state_dict=model.state_dict(),
+            args=vars(args),
+            best_val=state["best_val"],
+            test_acc=test_acc,
+            test_acc_tta=test_tta,
+        ),
+        os.path.join(out_dir, "best.pt"),
+    )
+    np.savez(
+        os.path.join(out_dir, "probs.npz"),
+        val=val_probs.numpy(),
+        test=test_probs.numpy(),
+        test_tta=test_probs_tta.numpy(),
+    )
+    with open(os.path.join(out_dir, "history.json"), "w") as fh:
+        json.dump(dict(history=state["history"], args=vars(args), test_acc=test_acc,
+                       test_acc_tta=test_tta, best_val=state["best_val"]), fh, indent=2)
+    print(f"saved to {out_dir}")
 
-    backbone.trainable = False
-    base_model = tf.keras.Model(backbone.input, backbone.layers[-29].output, name='base_model')
-
-    self_attention = tf.keras.layers.Attention(use_scale=True, name='attention')
-    patch_extraction = tf.keras.Sequential([
-        tf.keras.layers.SeparableConv2D(256, kernel_size=4, strides=4, padding='same', activation='relu'),
-        tf.keras.layers.SeparableConv2D(256, kernel_size=2, strides=2, padding='valid', activation='relu'),
-        tf.keras.layers.Conv2D(256, kernel_size=1, strides=1, padding='valid', activation='relu'),
-        SEBlock(256)
-    ], name='patch_extraction')
-    global_average_layer = tf.keras.layers.GlobalAveragePooling2D(name='gap')
-    pre_classification = tf.keras.Sequential([tf.keras.layers.Dense(32, activation='relu'),
-                                            tf.keras.layers.BatchNormalization()], name='pre_classification')
-    prediction_layer = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax", name='classification_head')
-
-    inputs = input_layer
-
-    x = SpatialTransformerLayer(output_size=(224, 224))(inputs)
-
-    x = sample_resizing(inputs)
-    x = data_augmentation(x)
-    x = preprocess_input(x)
-    x = base_model(x, training=False)
-
-    # x = CBAMLayer()(x) 
-
-    x = patch_extraction(x)
-    x = global_average_layer(x)
-    x = tf.keras.layers.Dropout(TRAIN_DROPOUT)(x)
-    x = pre_classification(x)
-
-    x = ExpandDimsLayer(axis=1)(x)  # Expand dimensions to make it 3D
-    x = self_attention([x, x])  # Apply Attention
-    x = SqueezeLayer(axis=1)(x)  # Squeeze back to 2D
-
-
-    outputs = prediction_layer(x)
-    model = tf.keras.Model(inputs, outputs, name='train-head')
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=TRAIN_LR, global_clipnorm=3.0), 
-                  loss='sparse_categorical_crossentropy', 
-                  metrics=['accuracy'])
-
-    # Callbacks
-    early_stopping_callback = tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=TRAIN_ES_PATIENCE, min_delta=ES_LR_MIN_DELTA, restore_best_weights=True)
-    learning_rate_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=TRAIN_LR_PATIENCE, verbose=0, min_delta=ES_LR_MIN_DELTA, min_lr=TRAIN_MIN_LR)
-
-    # Training
-    history = model.fit(train_ds, epochs=TRAIN_EPOCH, validation_data=val_ds, callbacks=[early_stopping_callback, learning_rate_callback])
-
-    # Model Finetuning
-    print("\nFinetuning ...")
-    unfreeze = 59
-    base_model.trainable = True
-    fine_tune_from = len(base_model.layers) - unfreeze
-    for layer in base_model.layers[:fine_tune_from]:
-        layer.trainable = False
-    for layer in base_model.layers[fine_tune_from:]:
-        if isinstance(layer, tf.keras.layers.BatchNormalization):
-            layer.trainable = False
-
-    inputs = input_layer
-
-    x = SpatialTransformerLayer(output_size=(224, 224))(inputs)
-
-    x = sample_resizing(inputs)
-    x = data_augmentation(x)
-    x = preprocess_input(x)
-    x = base_model(x, training=False)
-    x = patch_extraction(x)
-    x = tf.keras.layers.SpatialDropout2D(FT_DROPOUT)(x)
-    x = global_average_layer(x)
-    x = tf.keras.layers.Dropout(FT_DROPOUT)(x)
-    x = pre_classification(x)
-
-    x = ExpandDimsLayer(axis=1)(x)  # Expand dimensions to make it 3D
-    x = self_attention([x, x])  # Apply Attention
-    x = SqueezeLayer(axis=1)(x)  # Squeeze back to 2D
-
-    scheduler = keras.optimizers.schedules.InverseTimeDecay(initial_learning_rate=FT_LR, decay_steps=FT_LR_DECAY_STEP, decay_rate=FT_LR_DECAY_RATE)
-
-    x = tf.keras.layers.Dropout(FT_DROPOUT)(x)
-    outputs = prediction_layer(x)
-    model = tf.keras.Model(inputs, outputs, name='finetune-backbone')
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=scheduler, global_clipnorm=3.0),
-                  loss='sparse_categorical_crossentropy', 
-                  metrics=['accuracy'])
-
-    # Training Procedure
-    log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
-    early_stopping_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', min_delta=ES_LR_MIN_DELTA, patience=FT_ES_PATIENCE, restore_best_weights=True)
-    # scheduler_callback = tf.keras.callbacks.LearningRateScheduler(schedule=scheduler)
-
-    history_finetune = model.fit(train_ds, epochs=FT_EPOCH, validation_data=val_ds, callbacks=[early_stopping_callback, tensorboard_callback])
-
-    # # Plotting
-    # plt.figure(figsize=(12, 6))
-
-    # # Plot training accuracy
-    # plt.plot(history_finetune.history['accuracy'], label='Train Accuracy', color='#110A44')
-
-    # # Plot validation accuracy
-    # plt.plot(history_finetune.history['val_accuracy'], label='Validation Accuracy', color='#F1D43E')
-
-    # plt.title('Training and Validation Accuracy')
-    # plt.xlabel('Epoch')
-    # plt.ylabel('Accuracy')
-    # plt.legend()
-    # plt.show()
-
-    # # Plotting
-    # plt.figure(figsize=(12, 6))
-
-    # # Plot training loss
-    # plt.plot(history_finetune.history['loss'], label='Train Loss', color='#110A44')
-
-    # # Plot validation loss
-    # plt.plot(history_finetune.history['val_loss'], label='Validation Loss', color='#F1D43E')
-
-    # plt.title('Training and Validation Loss')
-    # plt.xlabel('Epoch')
-    # plt.ylabel('Loss')
-    # plt.legend()
-    # plt.show()
-
-    # Evaluation
-    test_loss, test_acc = model.evaluate(test_ds)
-    model.save('model.h5')
-
-    print('Test loss: %.3f accuracy: %.3f' % (test_loss, test_acc))
-
-    # class_names = test_ds.class_names
-    # print("Class names:", class_names)
-
-    # predictions = model.predict(test_ds)
-    # y_pred = np.argmax(predictions, axis=1)
-    # y_true = np.concatenate([y for x, y in test_ds], axis=0)
-    # report = classification_report(y_true, y_pred, target_names=class_names)
-    # print("Classification Report:")
-    # print(report)
-    
-    # conf_matrix = confusion_matrix(y_true, y_pred)
-
-    # # confusion matrix
-    # plt.figure(figsize=(10, 8))
-    # sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    # plt.xlabel('Predicted labels')
-    # plt.ylabel('True labels')
-    # plt.title('Confusion Matrix')
-    # plt.show()
+    per_class = {}
+    pred = test_probs_tta.argmax(dim=1)
+    y_true = test_y.cpu()
+    for i, cls in enumerate(CLASSES):
+        mask = y_true == i
+        per_class[cls] = (pred[mask] == i).float().mean().item()
+    print("per-class recall (TTA):", {k: round(v, 3) for k, v in per_class.items()})
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--train_epochs', 
-                        type=int, 
-                        default=30,
-                        help= "number of epochs the model needs to be trained for")
-    parser.add_argument('--ft_epochs', 
-                    type=int, 
-                    default=100,
-                    help= "number of epochs the feature extractor needs to be fine-tuned for")
-    parser.add_argument('--batch_size', 
-                        type=int, 
-                        default=32,
-                        help = "batch size for training")
-    parser.add_argument('--learning_rate', 
-                        type=float, 
-                        default =1e-3,
-                        help = "learning rate for training")
-    parser.add_argument('--dropout', 
-                        type=float, 
-                        default=0.1,
-                        help = "dropout rate for training")
-    
-    args = parser.parse_args()
-    main(**vars(args))
+def build_parser():
+    p = argparse.ArgumentParser(description="Train EmoPAtt-Lite on FER2013")
+    p.add_argument("--name", type=str, default="emopatt")
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--seed", type=int, default=0)
+
+    p.add_argument("--train_epochs", type=int, default=4, help="frozen-trunk head warmup")
+    p.add_argument("--ft_epochs", type=int, default=296, help="end-to-end fine-tune")
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--eval_batch_size", type=int, default=256)
+    p.add_argument("--learning_rate", type=float, default=1e-3, help="stage-1 LR")
+    p.add_argument("--ft_lr", type=float, default=2e-4, help="stage-2 backbone LR")
+    p.add_argument("--ft_head_lr", type=float, default=1e-3, help="stage-2 head LR")
+    p.add_argument("--weight_decay", type=float, default=0.05)
+    p.add_argument("--min_lr_ratio", type=float, default=0.01)
+    p.add_argument("--clip_grad", type=float, default=3.0)
+    p.add_argument("--ema_decay", type=float, default=0.9998)
+    p.add_argument("--amp", choices=["off", "fp16", "bf16"], default="off")
+
+    p.add_argument("--backbone", type=str, default="mobilenetv1_100")
+    p.add_argument("--stage", type=int, default=3, help="backbone feature stage (3 = stride 16)")
+    p.add_argument("--img_size", type=int, default=224)
+    p.add_argument("--embed_dim", type=int, default=256)
+    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--patch_stride", type=int, default=2)
+    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--drop_path", type=float, default=0.05)
+    p.add_argument("--no_stn", action="store_true")
+    p.add_argument("--no_cbam", action="store_true")
+
+    p.add_argument("--smoothing", type=float, default=0.1)
+    p.add_argument("--mixup", type=float, default=0.2)
+    p.add_argument("--cutmix", type=float, default=1.0)
+    p.add_argument("--mix_prob", type=float, default=0.5)
+    p.add_argument("--rotate", type=float, default=15.0)
+    p.add_argument("--translate", type=float, default=0.12)
+    p.add_argument("--scale_min", type=float, default=0.85)
+    p.add_argument("--scale_max", type=float, default=1.18)
+    p.add_argument("--brightness", type=float, default=0.25)
+    p.add_argument("--contrast", type=float, default=0.25)
+    p.add_argument("--erase", type=float, default=0.3)
+    return p
+
+
+if __name__ == "__main__":
+    main(build_parser().parse_args())

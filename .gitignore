@@ -1,1 +1,7 @@
 __pycache__/
+.venv/
+logs/
+runs/
+dataset/fer2013/
+dataset/FER2013/
+dataset/fer2013.npz

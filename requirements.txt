@@ -1,6 +1,5 @@
-tensorflow
-scikit-learn
-matplotlib
+torch>=2.2
+timm>=1.0.9
 numpy
-pillow
 pandas
+pillow

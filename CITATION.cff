@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "EmoPAtt-Lite: Lightweight Facial Emotion Recognition"
+authors:
+  - family-names: "Ben Seddik"
+    given-names: "Ismail"
+  - family-names: "Adelekan"
+    given-names: "Adebowale Emmanuel"
+preferred-citation:
+  type: conference-paper
+  title: "EmoPAtt-Lite: Lightweight Facial Emotion Recognition"
+  authors:
+    - family-names: "Ben Seddik"
+      given-names: "Ismail"
+    - family-names: "Adelekan"
+      given-names: "Adebowale Emmanuel"
+  collection-title: "Proceedings of International Conference on Information Technology and Applications"
+  collection-type: proceedings
+  publisher:
+    name: "Springer Nature Switzerland"
+  year: 2026
+  start: 102
+  end: 115
+  doi: "10.1007/978-3-032-21174-3_10"
+  isbn: "978-3-032-21174-3"
